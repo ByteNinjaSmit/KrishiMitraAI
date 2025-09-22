@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: repl-nix-workspace
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.11
+Requires-Dist: faiss-cpu>=1.12.0
+Requires-Dist: google-genai>=1.38.0
+Requires-Dist: langchain-core>=0.3.76
+Requires-Dist: langchain>=0.3.27
+Requires-Dist: langchain-community>=0.3.29
+Requires-Dist: langchain-openai>=0.3.33
+Requires-Dist: langdetect>=1.0.9
+Requires-Dist: openai>=1.108.1
+Requires-Dist: pandas>=2.3.2
+Requires-Dist: pypdf2>=3.0.1
+Requires-Dist: streamlit>=1.49.1
+Requires-Dist: langchain-text-splitters>=0.3.11
+Requires-Dist: sentence-transformers>=3.2.1
