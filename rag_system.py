@@ -14,6 +14,9 @@ import numpy as np
 import faiss
 import ollama
 import subprocess
+import hashlib
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
 try:
     import torch
@@ -26,6 +29,7 @@ class KrishiMitraRAG:
     def __init__(self):
         self.ollama_model = "llama2-uncensored:7b"
         self.use_ollama = self._check_ollama_available()
+        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
         """Initialize the RAG system for Krishi Mitra"""
         # Use GEMINI_API_KEY from environment (your existing Google API key will work)
@@ -133,53 +137,62 @@ Your role is to provide accurate, concise, and practical answers to farmers' que
         
         return all_documents
 
+    @staticmethod
+    def deduplicate_documents(documents: List[Document]) -> List[Document]:
+        seen = set()
+        unique_docs = []
+        for doc in documents:
+            hash_val = hashlib.md5(doc.page_content.strip().lower().encode()).hexdigest()
+            if hash_val not in seen:
+                seen.add(hash_val)
+                unique_docs.append(doc)
+        return unique_docs
 
 
     def _build_or_load_index(self):
-        """Build or load FAISS index and move it to GPU if available."""
+        device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+        self.build_status["device"] = device
+
+        embeddings = HuggingFaceEmbeddings(
+            model_name="intfloat/multilingual-e5-base",   # stronger retrieval model
+            model_kwargs={"device": device}
+        )
+
+
+        os.makedirs(self.index_dir, exist_ok=True)
+
+        # Separate FAQ vs Policy
+        faq_docs = [d for d in self.documents if d.metadata.get("document_type") == "faq"]
+        policy_docs = [d for d in self.documents if d.metadata.get("document_type") == "policy"]
+
+        # Deduplicate
+        faq_docs = self.deduplicate_documents(faq_docs)
+        policy_docs = self.deduplicate_documents(policy_docs)
+
+        # Load or build FAQ index
+        faq_path = os.path.join(self.index_dir, "faq")
         try:
-            # Detect device (GPU if available)
-            device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
-            self.build_status["device"] = device
-            self.build_status["last_message"] = f"Preparing embeddings on {device.upper()}"
+            self.faq_vectorstore = FAISS.load_local(faq_path, embeddings, allow_dangerous_deserialization=True)
+            print("Loaded existing FAQ index")
+        except Exception:
+            self.faq_vectorstore = FAISS.from_documents(faq_docs, embeddings) if faq_docs else None
+            if self.faq_vectorstore:
+                self.faq_vectorstore.save_local(faq_path)
 
-            # Load embeddings on GPU
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                model_kwargs={"device": device}
-            )
+        # Load or build Policy index
+        policy_path = os.path.join(self.index_dir, "policy")
+        try:
+            self.policy_vectorstore = FAISS.load_local(policy_path, embeddings, allow_dangerous_deserialization=True)
+            print("Loaded existing Policy index")
+        except Exception:
+            self.policy_vectorstore = FAISS.from_documents(policy_docs, embeddings) if policy_docs else None
+            if self.policy_vectorstore:
+                self.policy_vectorstore.save_local(policy_path)
 
-            os.makedirs(self.index_dir, exist_ok=True)
+        self.build_status["vectorstore_ready"] = True
+        self.build_status["last_message"] = "Vector stores (FAQ + Policy) ready"
 
-            try:
-                self.build_status["last_message"] = "Loading existing FAISS index"
-                self.vectorstore = FAISS.load_local(
-                    self.index_dir, embeddings, allow_dangerous_deserialization=True
-                )
-            except Exception:
-                self.build_status["last_message"] = "Building FAISS index (first run)"
-                self.vectorstore = FAISS.from_documents(self.documents, embeddings)
 
-                try:
-                    self.vectorstore.save_local(self.index_dir)
-                except Exception:
-                    pass
-
-            # 🚀 Move FAISS index to GPU if available
-            if torch.cuda.is_available():
-                import faiss
-                res = faiss.StandardGpuResources()
-                cpu_index = self.vectorstore.index
-                gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-                self.vectorstore.index = gpu_index
-                self.build_status["last_message"] = "Vector store ready on GPU"
-            else:
-                self.build_status["last_message"] = "Vector store ready on CPU"
-
-            self.build_status["vectorstore_ready"] = True
-
-        except Exception as e:
-            self.build_status["last_message"] = f"Index build error: {str(e)}"
 
 
     def _tokenize(self, text: str) -> List[str]:
@@ -188,85 +201,92 @@ Your role is to provide accurate, concise, and practical answers to farmers' que
         return tokens[:200]
 
     def _build_keyword_index(self):
-        """Build a lightweight inverted index across all docs for full-corpus fallback."""
+        """Build BM25 index for fallback retrieval"""
         try:
-            self.keyword_index = {}
-            self._doc_texts = []
-            for idx, doc in enumerate(self.documents):
-                content = doc.page_content
-                self._doc_texts.append(content)
-                for tok in set(self._tokenize(content)):
-                    postings = self.keyword_index.get(tok)
-                    if postings is None:
-                        self.keyword_index[tok] = [idx]
-                    else:
-                        if len(postings) < 800:  # cap postings to keep memory bounded
-                            postings.append(idx)
+            self._doc_texts = [doc.page_content for doc in self.documents]
+            tokenized_corpus = [self._tokenize(text) for text in self._doc_texts]
+            self.bm25 = BM25Okapi(tokenized_corpus)
             self.keyword_index_ready = True
         except Exception:
             self.keyword_index_ready = False
 
-    def retrieve_relevant_docs(self, query: str, k: int = 5) -> List[Document]:
-        """Retrieve relevant documents for the given query using vector similarity (FAISS),
-        falling back to simple keyword scoring if the vector store is unavailable."""
-        if not hasattr(self, 'documents'):
-            raise ValueError("Document store not initialized. Call initialize_system() first.")
-        
-        # Start with vector results if available
-        vector_results: List[Document] = []
-        if self.vectorstore is not None and self.build_status.get("vectorstore_ready", False):
-            try:
-                vector_results = self.vectorstore.similarity_search(query, k=max(k, 6))
-            except Exception as e:
-                # Fall back to keyword method on error
-                print(f"Vector search failed, falling back to keyword search: {str(e)}")
-        
-        # Keyword scoring via inverted index if available, else fallback to simple scan sample
-        keyword_results: List[Document] = []
-        if self.keyword_index_ready and len(self._doc_texts) == len(self.documents):
-            tokens = self._tokenize(query)
-            candidate_ids = set()
-            for t in tokens:
-                plist = self.keyword_index.get(t)
-                if plist:
-                    candidate_ids.update(plist)
-            # Score candidates by term frequency
-            scores = []
-            for i in candidate_ids:
-                text = self._doc_texts[i].lower()
-                score = sum(text.count(t) for t in tokens)
-                if score > 0:
-                    scores.append((score, i))
-            scores.sort(key=lambda x: x[0], reverse=True)
-            for _, i in scores[: max(k, 8)]:
-                keyword_results.append(self.documents[i])
-        else:
-            query_lower = query.lower()
-            scored_docs = []
-            corpus = self.documents if len(self.documents) <= 10000 else self.documents[:10000]
-            for doc in corpus:
-                content_lower = doc.page_content.lower()
-                score = 0
-                for word in query_lower.split():
-                    if len(word) > 2:
-                        score += content_lower.count(word)
-                if score > 0:
-                    scored_docs.append((score, doc))
-            scored_docs.sort(key=lambda x: x[0], reverse=True)
-            keyword_results = [doc for _, doc in scored_docs[:k]]
+    def _keyword_fallback(self, query: str, k: int = 5) -> List[Document]:
+        if not self.keyword_index_ready:
+            return []
+        query_tokens = self._tokenize(query)
+        scores = self.bm25.get_scores(query_tokens)
+        top_idx = np.argsort(scores)[::-1][:k]
+        return [self.documents[i] for i in top_idx if scores[i] > 0]
 
-        # Merge unique docs preserving order: vector first then keyword
-        seen = set()
-        merged: List[Document] = []
-        for d in list(vector_results) + list(keyword_results):
-            key = (d.metadata.get("file_path"), d.metadata.get("chunk_id"), d.page_content[:80])
+    def retrieve_relevant_docs(self, query: str, k: int = 5) -> List[Document]:
+        """
+        Retrieve relevant documents with FAQ priority, policy fallback,
+        deduplication, and Kerala-specific boosting.
+        Falls back to keyword search if vectors unavailable.
+        """
+
+        faq_hits, policy_hits = [], []
+        try:
+            if getattr(self, "faq_vectorstore", None):
+                faq_hits = self.faq_vectorstore.similarity_search(query, k=k)
+            if getattr(self, "policy_vectorstore", None):
+                policy_hits = self.policy_vectorstore.similarity_search(query, k=max(2, k // 2))
+        except Exception as e:
+            print(f"Vector search failed: {e}")
+
+        # If no vector hits, fallback to keyword index
+        if not faq_hits and not policy_hits:
+            return self._keyword_fallback(query, k)
+
+        # --- Kerala boosting ---
+        def boost_score(doc: Document, base: float) -> float:
+            text = doc.page_content.lower()
+            if "kerala" in text:
+                base *= 1.5
+            return base
+
+        scored_docs = []
+        for i, d in enumerate(faq_hits):
+            scored_docs.append((boost_score(d, 1.0 - i*0.01), d))
+        for i, d in enumerate(policy_hits):
+            scored_docs.append((boost_score(d, 0.7 - i*0.01), d))
+
+        # Deduplicate
+        seen, unique_docs = set(), []
+        for score, doc in sorted(scored_docs, key=lambda x: x[0], reverse=True):
+            key = (doc.metadata.get("file_path"), doc.metadata.get("chunk_id"), doc.page_content[:120])
             if key in seen:
                 continue
             seen.add(key)
-            merged.append(d)
-            if len(merged) >= max(k, 8):
+            unique_docs.append(doc)
+            if len(unique_docs) >= k:
                 break
-        return merged
+
+        if unique_docs:
+            rerank_inputs = [(query, d.page_content) for d in unique_docs]
+            scores = self.reranker.predict(rerank_inputs)
+            reranked = sorted(zip(scores, unique_docs), key=lambda x: x[0], reverse=True)
+            unique_docs = [d for _, d in reranked[:k]]
+
+        return unique_docs
+
+    def _keyword_fallback(self, query: str, k: int = 5) -> List[Document]:
+        """Fallback retrieval when vector stores fail"""
+        if not self.keyword_index_ready:
+            return []
+        tokens = self._tokenize(query)
+        candidate_ids = set()
+        for t in tokens:
+            candidate_ids.update(self.keyword_index.get(t, []))
+        scores = []
+        for i in candidate_ids:
+            text = self._doc_texts[i].lower()
+            score = sum(text.count(t) for t in tokens)
+            if score > 0:
+                scores.append((score, self.documents[i]))
+        scores.sort(key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in scores[:k]]
+
 
     def get_response(self, query: str) -> str:
         """Get response from Krishi Mitra using RAG with either Ollama (if available) or Gemini"""
@@ -328,17 +348,22 @@ Your role is to provide accurate, concise, and practical answers to farmers' que
 
 
     def _prepare_context(self, documents: List[Document]) -> str:
-        """Prepare context from retrieved documents"""
+        """Prepare context with clear FAQ vs Policy labeling"""
         context_parts = []
-        
         for i, doc in enumerate(documents):
             content = doc.page_content.strip()
-            if content:
-                source = doc.metadata.get("source", "Unknown source")
-                label = f"Document {i+1} ({source})"
-                context_parts.append(f"{label}:\n{content}")
-        
+            if not content:
+                continue
+            dtype = doc.metadata.get("document_type", "doc")
+            if dtype == "faq":
+                label = f"FAQ Answer {i+1}"
+            elif dtype == "policy":
+                label = f"Policy Reference {i+1}"
+            else:
+                label = f"Document {i+1}"
+            context_parts.append(f"{label}:\n{content}")
         return "\n\n".join(context_parts)
+
 
     def _prepare_prompt(self, query: str, context: str, language: str, dataset_facts: List[str] = None) -> str:
         """Prepare the final prompt for the language model"""
