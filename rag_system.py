@@ -37,7 +37,7 @@ class KrishiMitraRAG:
     }
 
     def __init__(self):
-        self.ollama_model = "llama2-uncensored:7b"
+        self.ollama_model = "gemma3:12b"
         self.use_ollama = self._check_ollama_available()
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
