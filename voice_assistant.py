@@ -3,6 +3,8 @@
 
 import streamlit as st
 from utils import detect_language
+from gtts import gTTS
+
 try:
     import speech_recognition as sr
     import pyttsx3
@@ -30,6 +32,27 @@ class VoiceAssistant:
             except Exception as e:
                 st.warning(f"Voice features partially unavailable: {str(e)}")
                 self.voice_available = False
+
+    def generate_malayalam_audio(self, text: str) -> str:
+        """Generate Malayalam audio using gTTS and return HTML player"""
+        try:
+            from io import BytesIO
+            import base64
+            tts = gTTS(text=text, lang="ml")
+            audio_fp = BytesIO()
+            tts.write_to_fp(audio_fp)
+            audio_fp.seek(0)
+            audio_base64 = base64.b64encode(audio_fp.read()).decode()
+            return f"""
+            <audio controls autoplay style="margin-top:10px; width:100%;">
+                <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+                Your browser does not support the audio element.
+            </audio>
+            """
+        except Exception as e:
+            return f"<p style='color:red;'>Malayalam TTS failed: {str(e)}</p>"
+
+
     
     def init_tts(self):
         """Initialize text-to-speech engine"""
@@ -192,7 +215,7 @@ class VoiceAssistant:
         """
     
     def create_audio_player_html(self, text: str, lang_code: str) -> str:
-        """Create HTML for audio playback using Web Speech API"""
+        """Create HTML for audio playback. Uses gTTS for Malayalam, Web Speech API for English."""
         # Clean text for speech
         clean_text = text.replace('*', '').replace('#', '').replace('`', '')
         clean_text = clean_text.replace('\n', '. ')
@@ -201,6 +224,11 @@ class VoiceAssistant:
         if len(clean_text) > 500:
             clean_text = clean_text[:500] + "..."
         
+        # ✅ Malayalam handled via gTTS
+        if lang_code.startswith("ml"):
+            return self.generate_malayalam_audio(clean_text)
+
+        # ✅ English handled via Web Speech API
         return f"""
         <div style="background: linear-gradient(135deg, #2196F3, #1976D2); 
                     padding: 15px; border-radius: 10px; margin: 10px 0;">
@@ -231,25 +259,15 @@ class VoiceAssistant:
             const text = `{clean_text}`;
             currentUtterance = new SpeechSynthesisUtterance(text);
             currentUtterance.lang = '{lang_code}';
-            // Configure speech
             currentUtterance.rate = 0.9;
             currentUtterance.pitch = 1;
             currentUtterance.volume = 0.8;
             
-            // Try to use an Indian English voice
             const voices = speechSynthesis.getVoices();
             let selected = null;
-            // Prefer Malayalam voices when lang is ml-IN
-            if ('{lang_code}'.startsWith('ml')) {{
-                for (let v of voices) {{
-                    if (v.lang && v.lang.toLowerCase().includes('ml')) {{ selected = v; break; }}
-                    if (v.name && v.name.toLowerCase().includes('malayalam')) {{ selected = v; break; }}
-                }}
-            }}
-            // Otherwise prefer Indian English
-            if (!selected) {{
-                for (let v of voices) {{
-                    if (v.lang && (v.lang.includes('en-IN') || v.lang.includes('en-GB') || v.lang.includes('en-US'))) {{ selected = v; break; }}
+            for (let v of voices) {{
+                if (v.lang && (v.lang.includes('en-IN') || v.lang.includes('en-GB') || v.lang.includes('en-US'))) {{
+                    selected = v; break;
                 }}
             }}
             if (selected) {{ currentUtterance.voice = selected; }}
@@ -275,15 +293,9 @@ class VoiceAssistant:
                 document.getElementById('speech-status').textContent = '⏹️ Stopped';
             }}
         }}
-
-        // Load voices when available
-        if (speechSynthesis.onvoiceschanged !== undefined) {{
-            speechSynthesis.onvoiceschanged = function() {{
-                // Voices loaded, ready to use
-            }};
-        }}
         </script>
         """
+
     
     def display_voice_input_interface(self):
         """Display voice input interface in Streamlit"""
