@@ -1,6 +1,8 @@
 import os
 import json
 from typing import List, Dict
+from io import BytesIO
+from PIL import Image, ImageOps
 import pandas as pd
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -43,7 +45,8 @@ class KrishiMitraRAG:
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
         # api_key = os.getenv("GEMINI_API_KEY", "YOUR_FALLBACK_KEY_HERE")
-        api_key = "AIzaSyDx4B06Bpq1Vws_TxpVxD99LIoNckwCy_g"
+        # api_key = "AIzaSyDx4B06Bpq1Vws_TxpVxD99LIoNckwCy_g"
+        api_key = "AIzaSyD4cJTv7Coe-tR3POHUehzJy97quyoBtZo"
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required.")
         self.gemini_client = genai.Client(api_key=api_key)
@@ -380,20 +383,37 @@ Rules:
         Returns disease identification and treatment recommendations.
         """
         try:
-            # Open image in binary
-            with open(image_path, "rb") as img_file:
-                image_bytes = img_file.read()
+            # Load and preprocess image to handle any size/resolution
+            with Image.open(image_path) as pil_img:
+                # Normalize orientation using EXIF, convert to RGB
+                pil_img = ImageOps.exif_transpose(pil_img)
+                if pil_img.mode not in ("RGB", "RGBA"):
+                    pil_img = pil_img.convert("RGB")
 
-            # Send image + instruction to Gemini
-            response = self.gemini_client.models.generate_content(
-                model="gemini-1.5-flash",   # use a multimodal model
-                contents=[
-                    {
-                        "role": "user",
-                        "parts": [
-                            {"mime_type": "image/jpeg", "data": image_bytes},
-                            {
-                                "text": """You are Krishi Mitra, an agriculture expert for Kerala farmers.
+                # If RGBA, drop alpha on white background
+                if pil_img.mode == "RGBA":
+                    background = Image.new("RGB", pil_img.size, (255, 255, 255))
+                    background.paste(pil_img, mask=pil_img.split()[3])
+                    pil_img = background
+
+                # Resize while keeping aspect ratio; cap longest side to 1280px
+                max_side = 1280
+                width, height = pil_img.size
+                scale = min(1.0, float(max_side) / float(max(width, height)))
+                if scale < 1.0:
+                    new_size = (int(width * scale), int(height * scale))
+                    pil_img = pil_img.resize(new_size, Image.LANCZOS)
+
+                # Re-encode as optimized JPEG to control size for upload
+                buf = BytesIO()
+                pil_img.save(buf, format="JPEG", quality=88, optimize=True)
+                buf.seek(0)
+                image_bytes = buf.read()
+
+            # Send image + instruction to Gemini (use typed Parts/Content)
+            image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            text_part = types.Part.from_text(text=
+                """You are Krishi Mitra, an agriculture expert for Kerala farmers.
 Identify any visible crop disease, pest, or deficiency in this image.
 Then give:
 - Name of disease/pest (if identifiable)
@@ -403,10 +423,12 @@ Then give:
 
 Keep response short and farmer-friendly.
 If unsure, say: "Please consult your local Krishi Bhavan for expert advice." """
-                            }
-                        ]
-                    }
-                ]
+            )
+            user_content = types.Content(role="user", parts=[image_part, text_part])
+
+            response = self.gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[user_content]
             )
 
             if hasattr(response, "text") and response.text.strip():

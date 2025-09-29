@@ -242,7 +242,7 @@ with tab2:
             col1, col2 = st.columns([1, 1])
             
             with col1:
-                st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+                st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
             
             with col2:
                 if st.button("🔍 Analyze Crop", type="primary"):
@@ -277,7 +277,10 @@ with tab2:
                                     "content": f"🔍 **Crop Analysis:** {analysis}"
                                 })
                             # After showing analysis result
-                            voice_assistant.create_voice_output_for_response(analysis)
+                            try:
+                                st.session_state.voice_assistant.create_voice_output_for_response(analysis)
+                            except Exception:
+                                pass
 
                             # Clean up temporary file
                             os.unlink(tmp_file_path)
