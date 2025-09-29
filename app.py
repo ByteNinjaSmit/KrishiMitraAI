@@ -276,7 +276,9 @@ with tab2:
                                     "role": "assistant", 
                                     "content": f"🔍 **Crop Analysis:** {analysis}"
                                 })
-                            
+                            # After showing analysis result
+                            voice_assistant.create_voice_output_for_response(analysis)
+
                             # Clean up temporary file
                             os.unlink(tmp_file_path)
                             

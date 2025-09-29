@@ -37,7 +37,8 @@ class KrishiMitraRAG:
     }
 
     def __init__(self):
-        self.ollama_model = "gemma3:12b"
+        # self.ollama_model = "gemma3:12b"
+        self.ollama_model ="llama3.2:3b"
         self.use_ollama = self._check_ollama_available()
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
@@ -371,3 +372,48 @@ Rules:
         if len(answer.strip()) < 10 and facts:
             return self._compose_answer_from_facts("", lang, facts)
         return answer
+    
+        # ----------------- Crop Disease Detection -----------------
+    def analyze_crop_image(self, image_path: str) -> str:
+        """
+        Analyze a crop image using Gemini multimodal model.
+        Returns disease identification and treatment recommendations.
+        """
+        try:
+            # Open image in binary
+            with open(image_path, "rb") as img_file:
+                image_bytes = img_file.read()
+
+            # Send image + instruction to Gemini
+            response = self.gemini_client.models.generate_content(
+                model="gemini-1.5-flash",   # use a multimodal model
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"mime_type": "image/jpeg", "data": image_bytes},
+                            {
+                                "text": """You are Krishi Mitra, an agriculture expert for Kerala farmers.
+Identify any visible crop disease, pest, or deficiency in this image.
+Then give:
+- Name of disease/pest (if identifiable)
+- Symptoms observed
+- Treatment steps (fertilizer, pesticide, or cultural practices)
+- Precautionary tips
+
+Keep response short and farmer-friendly.
+If unsure, say: "Please consult your local Krishi Bhavan for expert advice." """
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            if hasattr(response, "text") and response.text.strip():
+                return clean_text(response.text.strip())
+            else:
+                return "Sorry, I could not analyze this image. Please try again with a clearer photo."
+
+        except Exception as e:
+            return f"Error analyzing crop image: {str(e)}"
+

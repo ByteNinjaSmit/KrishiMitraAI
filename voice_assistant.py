@@ -271,7 +271,7 @@ class VoiceAssistant:
                 }}
             }}
             if (selected) {{ currentUtterance.voice = selected; }}
-            
+            ~
             currentUtterance.onstart = function() {{
                 document.getElementById('speech-status').textContent = '🔊 Speaking...';
             }};
